@@ -1,0 +1,4 @@
+export ANSIBLE_LOCALHOST_WARNING=false
+export VMWARE_PASSWORD='senha-vsphere'
+export VMWARE_USER='usuario-vsphere'
+export VMWARE_VALIDATE_CERTS=false

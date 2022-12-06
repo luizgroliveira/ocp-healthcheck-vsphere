@@ -1,0 +1,55 @@
+---
+- name: Verificação de melhores praticas de nodes OCP no Vsphere
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubeconfig: config
+    contextos: ""
+  tasks:
+    - name: Lista dos contextos do kubeconfig
+      debug:
+        msg: "{{ config |  community.general.json_query(query) }}"
+      vars: 
+        config: "{{ lookup('ansible.builtin.file', kubeconfig) | from_yaml }}"
+        query: contexts[].name
+      register: contexts_kubeconfig
+      tags:
+        - always
+
+    - name: Verifica se o contexto informado existe
+      assert:
+        fail_msg: "Contexto {{ item }} não existe no arquivo {{ kubeconfig }}"
+        success_msg: "Contexto {{ item }} existe no arquivo {{ kubeconfig }}"
+        that:
+          - item in contexts_kubeconfig.msg
+        quiet: yes
+      loop: "{{ contextos.split(',') }}"
+      when: contextos
+      tags:
+        - always
+
+    - name: Configurando os contextos informados
+      ansible.builtin.set_fact:
+        loop_contextos: "{{ contextos.split(',') }}"
+      when: contextos
+      tags:
+        - always
+
+    - name: Configurando os contextos existentes
+      ansible.builtin.set_fact:
+        loop_contextos: "{{ contexts_kubeconfig.msg }}"
+      when: not contextos
+      tags:
+        - always        
+
+    - name: Loop cluster
+      ansible.builtin.include_tasks: check-include.yaml
+      vars: 
+        config: "{{ lookup('ansible.builtin.file', kubeconfig) | from_yaml }}"
+        query: contexts[].name
+      loop: "{{ loop_contextos }}"
+      loop_control:
+        loop_var: context
+      tags:
+        - always 

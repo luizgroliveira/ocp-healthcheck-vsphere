@@ -1,0 +1,452 @@
+---
+- name: "{{ context }} - Busca informações do Vsphere"
+  kubernetes.core.k8s_info:
+    kind: ConfigMap
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"
+    namespace: openshift-config
+    name: cloud-provider-config
+  register: vsphere_info
+  failed_when: "'Reason: Forbidden' in vsphere_info.msg"
+  tags:
+    - cpu
+    - datastore
+    - master
+    - node
+    
+- name: debug
+  debug:
+    var: vsphere_info
+
+- name: "{{ context }} - Validando acesso ao OCP"
+  ansible.builtin.assert:
+    success_msg: "Buscado informações do Vsphere corretamente"
+    fail_msg: "Favor verificar o token de acesso ao Openshift"
+    that: vsphere_info.resources != []
+    quiet: yes
+  tags:
+    - cpu
+    - datastore
+    - master
+    - node
+
+- name: "{{ context }} - Cria arquivo temporario com os dados do Vsphere"
+  ansible.builtin.tempfile:
+    state: file
+    path: /tmp/
+  register: tempfile
+  changed_when: false
+  tags:
+    - cpu
+    - datastore
+    - master
+    - node
+
+- name: "{{ context }} - Salva as informações no arquivo temporário"
+  ansible.builtin.copy:
+    content: "{{ vsphere_info.resources[0].data.config }}"
+    dest: "{{ tempfile.path }}"
+  changed_when: false
+  tags:
+    - cpu
+    - datastore
+    - master
+    - node
+
+- name: "{{ context }} - Gera as variavéis do acesso ao Vsphere"
+  ansible.builtin.set_fact:
+    vsphere_host: "{{ lookup('ansible.builtin.ini', 'server', file=tempfile.path, section='Workspace') |replace('\"','') }}"
+    vsphere_datacenter: "{{ lookup('ansible.builtin.ini', 'datacenter', file=tempfile.path, section='Workspace') |replace('\"','') }}"
+    vsphere_datastore:  "{{ lookup('ansible.builtin.ini', 'default-datastore', file=tempfile.path, section='Workspace') |replace('\"','') }}"
+  tags:
+    - cpu
+    - datastore
+    - master
+    - node
+
+- name: "{{ context }} - Remove o arquivo temporário"
+  ansible.builtin.file:
+    path: "{{ tempfile.path }}"
+    state: absent
+  changed_when: false
+  tags:
+    - cpu
+    - datastore
+    - master
+    - node
+
+- name: "{{ context }} - Busca nodes master"
+  kubernetes.core.k8s_info:
+    kind: Node
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"
+    label_selectors:
+      - node-role.kubernetes.io/master=
+      # - node.k8s.bb/pool=workload-apps
+      # - node.k8s.bb/servico=metrics
+  register: nodes_master
+  tags:
+    - master
+    - cpu
+    - node
+
+# https://docs.vmware.com/en/vRealize-Operations/8.6/com.vmware.vcom.metrics.doc/GUID-E68037C7-7FC3-41F6-9AAC-1DE6D0D36213.html
+- name: "{{ context }} - Busca vm"
+  community.vmware.vmware_guest_info:
+    hostname: "{{ vsphere_host }}"
+    datacenter: "{{ vsphere_datacenter }}"
+    name: "{{ item }}"
+    schema: vsphere
+    properties: [
+      "config.cpuAllocation.reservation",
+      "config.hardware.memoryMB",
+      "config.hardware.numCPU",
+      "config.memoryAllocation.reservation",
+      "config.name",
+      "runtime.host",
+      "summary.config.uuid",
+    ]
+  loop: "{{ nodes_master | community.general.json_query('resources[*].metadata.name') }}"
+  register: vm
+  tags:
+    - master
+    - cpu
+    - node
+
+- name: "{{ context }} - CPU reservada não é igual a quantidade de CPU da maquina"
+  ansible.builtin.assert:
+    success_msg: "CPU reservation configurado corretamente"
+    fail_msg: "CPU reservation incorreto host/reservadas:
+      {{ vm | community.general.json_query(numCPU) | int }}/
+      {{ vm | community.general.json_query(cpuAllocation) | int }}"
+    that: (vm | community.general.json_query(numCPU) | int) == (vm | community.general.json_query(cpuAllocation) | int)
+    quiet: yes
+  loop: "{{ nodes_master | community.general.json_query('resources[*].metadata.name') }}"
+  vars:
+    - numCPU: "results[?item=='{{ item }}'].instance.config.hardware.numCPU | [0]"
+    - cpuAllocation: "results[?item=='{{ item }}'].instance.config.cpuAllocation.reservation | [0]"
+  ignore_errors: true
+  tags:
+    - cpu
+
+- name: "{{ context }} - Memória reservada não é igual a quantidade de memória do host"
+  ansible.builtin.assert:
+    success_msg: "Memória reservation configurado corretamente"
+    fail_msg: "Memória reservation incorreto host/reservadas:
+      {{ vm | community.general.json_query(memoryMB) | int }}/
+      {{ vm | community.general.json_query(memoryAllocation) | int }}" 
+    that: (vm | community.general.json_query(memoryMB) | int) == (vm | community.general.json_query(memoryAllocation) | int)
+    quiet: yes
+  loop: "{{ nodes_master | community.general.json_query('resources[*].metadata.name') }}"
+  vars:
+    - memoryMB: "results[?item=='{{ item }}'].instance.config.hardware.memoryMB | [0]"
+    - memoryAllocation: "results[?item=='{{ item }}'].instance.config.memoryAllocation.reservation | [0]"
+  ignore_errors: true
+  tags:
+    - memory
+
+- name: "{{ context }} - Verifica se os nodes estão em nodes separados"
+  ansible.builtin.assert:
+    fail_msg: "Nodes não estão em hosts separados"
+    success_msg: "Nodes estão em hosts separados"
+    that:
+      - vm | community.general.json_query(buscahost) | unique | length == 3
+    quiet: yes
+  vars:
+    - buscahost: "results[].instance.runtime.host"
+  ignore_errors: true
+  tags:
+    - master
+
+# - name: Reconfigura CPU e Memoria reservada
+#   community.vmware.vmware_guest:
+#     name: "{{ item }}"
+#     hardware:
+#       cpu_reservation: "{{ vm | community.general.json_query(query_numCPU) | int }}"    
+#       memory_reservation_lock: true
+#       memory_reservation: "{{ vm | community.general.json_query(query_memoryMB) | int }}"
+#   loop: "{{ nodes_master | community.general.json_query('resources[*].metadata.name') }}"
+#   vars:
+#     - query_numCPU:   "results[?item=='{{ item }}'].instance.config.hardware.numCPU   | [0]"
+#     - query_memoryMB: "results[?item=='{{ item }}'].instance.config.hardware.memoryMB | [0]"
+
+# - name: Busca nodes master
+#   kubernetes.core.k8s_info:
+#     kind: Node
+#     label_selectors:
+#       - node-role.kubernetes.io/master=
+#     #   - node.k8s.bb/pool=workload-apps
+#   register: nodes_master
+
+# - name: debug
+#   ansible.builtin.debug:
+#     var: nodes_master | community.general.json_query('resources[*].metadata.name | [0]') | split('-') | first  
+
+# - name: Create a DRS  rule for vms
+#   vmware_vm_vm_drs_rule:
+#     drs_rule_name: "drs_rule_{{  nodes_master ~| community.general.json_query('resources[*].metadata.name | [0]') | split('-') | first }}"
+#     cluster_name: "{{  nodes_master | community.general.json_query('resources[*].metadata.name | [0]') | split('-') | first }}"
+#     vms: "{{ nodes_master | community.general.json_query('resources[*].metadata.name') }}"
+#     enabled: true
+#     affinity_rule: trueAffinity
+#     mandatory: true
+#   register: drs_rule
+
+# - ansible.builtin.debug: var=drs_rule
+
+- name: "{{ context }} - Busca informações sobre o datastore"
+  community.vmware.vmware_datastore_info:
+    hostname: "{{ vsphere_host }}"
+    # hostname: '{{ vcenter_hostname }}'
+    # username: '{{ vcenter_username }}'
+    # password: '{{ vcenter_password }}'
+    datacenter: "{{ vsphere_datacenter }}"
+    name: "{{ vsphere_datastore }}" #G1500CL1_LUN0174
+  register: datastore_info
+  tags:
+    - datastore
+    - never
+
+- name: "{{ context }} - Garante que tenha pelo menos 20% de espaço disponível no Datastore"
+  ansible.builtin.assert:
+    fail_msg: "Datastore com menos de 20% livre"
+    success_msg: "Datastore com espaço suficiente"
+    that:
+      - ( datastore_info.datastores[0].freeSpace | int / datastore_info.datastores[0].capacity | int ) > 0.2
+    quiet: yes
+  ignore_errors: true
+  tags:
+    - datastore
+    - never
+
+- name: "{{ context }} - Busca informações sobre machine"
+  kubernetes.core.k8s_info:
+    kind: Machine
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"
+    api_version: machine.openshift.io/v1beta1
+    namespace: openshift-machine-api
+  register: machine_info
+  tags:
+    - machine
+
+# - name: "{{ context }} - Lista de machines com status Failed"
+#   debug:
+#     var: machine_info | community.general.json_query(machine)
+#   vars:
+#     - machine: resources[?status.phase=='Failed'].metadata.name
+#   tags:
+#     - machine
+
+- name: "{{ context }} - Lista de machines com status Failed"
+  ansible.builtin.assert:
+    fail_msg: "Machines com status Failed: {{ machine_info | community.general.json_query(machine) | join(', ') }}"
+    success_msg: "Nenhuma machine com o status Failed"
+    that:
+      - machine_info | community.general.json_query(machine) == []
+    quiet: yes
+  vars:
+    - machine: resources[?status.phase=='Failed'].metadata.name
+  ignore_errors: true
+  tags:
+    - machine
+
+#########################################################################################
+- name: "{{ context }} - Busca informações sobre machine"
+  kubernetes.core.k8s_info:
+    kind: MachineConfigPool
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"
+    api_version: machineconfiguration.openshift.io/v1
+  register: mcp_info
+  tags:
+    - mcp
+
+- name: "{{ context }} - Validação de MachineConfigPool"
+  ansible.builtin.assert:
+    fail_msg: "MachineConfigPool degradado/atualizando: {{ mcp_info | community.general.json_query(mcp) | join(', ') }}"
+    success_msg: "Nenhuma MachineConfigPool degradada ou atualizando"
+    that:
+      - mcp_info | community.general.json_query(mcp) == []
+    quiet: yes
+  vars:
+    - mcp: resources[?status.conditions[?contains(`["Degraded","Updating"]`,type)&&status!='False']].metadata.name
+  ignore_errors: true
+  tags:
+    - mcp´
+
+#########################################################################################
+- name: "{{ context }} - Busca informações sobre certificados"
+  kubernetes.core.k8s_info:
+    kind: CertificateSigningRequest
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"
+    api_version: certificates.k8s.io/v1
+  register: csr_info
+  tags:
+    - csr
+
+- name: "{{ context }} - Validação de CertificateSigningRequest pendentes"
+  ansible.builtin.assert:
+    fail_msg: "CertificateSigningRequest pendentes: {{  csr_info | community.general.json_query(csr) | join(', ') }}"
+    success_msg: "Nenhum CertificateSigningRequest pendentes"
+    that:
+      - csr_info | community.general.json_query(csr) == []
+    quiet: yes
+  vars:
+    - csr: "resources[?length(status)==`0`].metadata.name"
+  ignore_errors: true
+  tags:
+    - csr
+
+#########################################################################################
+- name: "{{ context }} - Busca informações sobre nodes NotReady"
+  kubernetes.core.k8s_info:
+    kind: Node
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"
+  register: nodes_info
+  tags: 
+    - notready
+
+- name: "{{ context }} - Validação de Nodes NotReady"
+  ansible.builtin.assert:
+    fail_msg: "Nodes NotReady: {{ nodes_info | community.general.json_query(notready) | join(', ') }}"
+    success_msg: "Nenhum Nodes NotReady"
+    that:
+      -  nodes_info | community.general.json_query(notready) | length == 0
+    quiet: yes
+  vars:
+    - notready: "resources|[?status.conditions[?reason=='KubeletReady'&&type=='Ready'&&status=='False']].metadata.name"
+  ignore_errors: true
+  tags:
+    - notready
+  
+#########################################################################################
+- name: "{{ context }} - Busca Pods do collectors"
+  kubernetes.core.k8s_info:
+    kind: Pod
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"
+    namespace: openshift-logging
+    field_selectors:
+      - status.phase!=Running
+      - status.phase!=Completed
+      - status.phase!=Succeeded
+  register: collectors_info
+  tags:
+    - collectors
+
+- name: "{{ context }} - Validação de Pods de collector estão rodando"
+  ansible.builtin.assert:
+    fail_msg: "Pods de collector com erro no namaspace openshift-logging: {{ collectors_info | community.general.json_query(collectors)  }}" # | join(', ')
+    success_msg: "Pods de collector estão todos rodando"
+    that:
+      -  collectors_info | community.general.json_query(collectors) | length == 0
+    quiet: yes
+  vars:
+    - collectors: "resources[*].metadata.name"
+  ignore_errors: true
+  tags:
+    - collectors
+
+#########################################################################################
+- name: "{{ context }} - Busca Pods do dns"
+  kubernetes.core.k8s_info:
+    kind: Pod
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"
+    namespace: openshift-dns
+    field_selectors:
+      - status.phase!=Running
+      # - status.phase!=Completed
+      # - status.phase!=Succeeded
+  register: dns_info
+  tags:
+    - dns
+
+- name: "{{ context }} - Validação de Pods de DNS estão rodando"
+  ansible.builtin.assert:
+    fail_msg: "Pods de dns com erro no namaspace openshift-dns: {{ dns_info | community.general.json_query(query)  }}" # | join(', ')
+    success_msg: "Pods de dns estão todos rodando"
+    that:
+      -  dns_info | community.general.json_query(dns) | length == 0
+    quiet: yes
+  vars:
+    - dns: "resources[*].metadata.name"
+  ignore_errors: true
+  tags:
+    - dns
+
+#########################################################################################
+- name: "{{ context }} - Busca cluster operator"
+  kubernetes.core.k8s_info:
+    kind: ClusterOperator
+    api_version: config.openshift.io/v1
+  register: cluster_operators
+  tags:
+    - cluster_operator
+
+- name: "{{ context }} - Loop ClusterOperator"
+  kubernetes.core.k8s_info:
+    kind: ClusterOperator
+    api_version: config.openshift.io/v1
+    name: "{{ item }}"
+  register: cluster_operator
+  loop: "{{ cluster_operators | community.general.json_query('resources[*].metadata.name') }}"
+  tags:
+    - cluster_operator
+
+- name: "{{ context }} - Stauts Cluster Operator"
+  ansible.builtin.assert:
+    success_msg: "Cluster Operator integro: {{ item.item }}"
+    fail_msg: "Cluster Operator degradado: {{ item.item }}"
+    that:
+      - "item | community.general.json_query(available)   == 'True'"
+      - "item | community.general.json_query(degraded)    == 'False'"
+      - "item | community.general.json_query(progressing) == 'False'"
+    quiet: true
+  loop: "{{ cluster_operator.results }}"
+  vars:
+    - available: resources[0].status.conditions[?type=='Available'].status|[0]
+    - degraded: resources[0].status.conditions[?type=='Degraded'].status|[0]
+    - progressing: resources[0].status.conditions[?type=='Progressing'].status|[0]
+  ignore_errors: true
+  tags:
+    - cluster_operator
+
+#########################################################################################
+- name: "{{ context }} - Busca informações sobre PVC"
+  kubernetes.core.k8s_exec:
+    kubeconfig: "{{ kubeconfig }}"
+    context: "{{ context }}"  
+    namespace: openshift-monitoring
+    pod: prometheus-k8s-0
+    command: >-
+      sh -c "curl -gs 'localhost:9090/api/v1/query?query=(100*sum(kubelet_volume_stats_used_bytes)by(persistentvolumeclaim)/sum(kubelet_volume_stats_capacity_bytes)by(persistentvolumeclaim))>90' | grep -Po '(?<=persistentvolumeclaim\":\")([^\"]*)'"    
+  register: command_status
+  changed_when: false
+  failed_when:
+    - command_status.rc != 0
+    - command_status.rc != 1
+  ignore_errors: True
+  tags:
+    - pvc
+
+- name: "{{ context }} - Verifica PVC com mais de 90% em uso"
+  ansible.builtin.assert:
+    fail_msg: "PVC com mais de 90% em uso: {{  command_status.stdout_lines  | join(', ') }}"
+    success_msg: "Nenhum PVC com mais de 90% em uso"
+    that:
+      - command_status.stdout_lines == []
+    quiet: yes
+  ignore_errors: true
+  tags:
+    - pvc
+
+
+#########################################################################################
+# Filesystem do node
+# 100 - ((node_filesystem_avail_bytes{mountpoint="/",fstype!="rootfs"} * 100) / node_filesystem_size_bytes{mountpoint="/",fstype!="rootfs"})
+
+
