@@ -10,6 +10,12 @@ pip install poetry
 
 Outras formas de instalação também pode ser visualizadas na [documentação](https://python-poetry.org/docs/#installation).
 
+Instalando os pacotes via poetry
+
+```
+poetry install
+```
+
 ## Fazer a instação das collections:
 
 Realizando a instalação das collections do [Ansible](https://docs.ansible.com/ansible/latest/index.html)
